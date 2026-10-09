@@ -118,9 +118,9 @@ jobs:
           set -e
           cd /
           python3 - <<'PY'
-          import cffi, curl_cffi
+          import _cffi_backend, curl_cffi
           from curl_cffi import requests
-          print("python-cffi", cffi.__version__, "| curl_cffi", curl_cffi.__version__)
+          print("cffi-backend", _cffi_backend.__version__, "| curl_cffi", curl_cffi.__version__)
           assert curl_cffi.__version__ == "${{ needs.check.outputs.version }}", curl_cffi.__version__
           r = requests.get("https://pypi.org/pypi/curl_cffi/json", impersonate="chrome", timeout=30)
           r.raise_for_status()
