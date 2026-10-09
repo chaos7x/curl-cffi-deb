@@ -1,0 +1,168 @@
+name: Build curl_cffi .deb
+
+on:
+  schedule:
+    # täglich 05:17 UTC nach neuen Versionen auf PyPI schauen
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "curl_cffi-Version (leer = neueste stabile von PyPI)"
+        required: false
+      revision:
+        description: "Debian-Revision"
+        required: false
+        default: "1"
+      force:
+        description: "Auch bauen, wenn das Release schon existiert"
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - build-deb.sh
+      - .github/workflows/build.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-deb
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      revision: ${{ steps.ver.outputs.revision }}
+      tag: ${{ steps.ver.outputs.tag }}
+      build: ${{ steps.ver.outputs.build }}
+    steps:
+      - name: Version ermitteln
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IN_VERSION: ${{ inputs.version }}
+          IN_REVISION: ${{ inputs.revision }}
+          IN_FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          if [ -n "${IN_VERSION:-}" ]; then
+            version="$IN_VERSION"
+          else
+            # info.version ist immer die neueste stabile Version (keine Betas)
+            version="$(curl -fsSL https://pypi.org/pypi/curl_cffi/json | jq -r .info.version)"
+          fi
+          revision="${IN_REVISION:-1}"
+          tag="v${version}-${revision}"
+          build=true
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if [ "${IN_FORCE:-false}" = "true" ]; then
+              echo "Release $tag existiert, wird wegen force neu gebaut."
+            else
+              echo "Release $tag existiert bereits - nichts zu tun."
+              build=false
+            fi
+          fi
+          echo "curl_cffi $version (Tag $tag), build=$build"
+          {
+            echo "version=$version"
+            echo "revision=$revision"
+            echo "tag=$tag"
+            echo "build=$build"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64, armhf]
+    steps:
+      - uses: actions/checkout@v4
+      - name: .deb bauen
+        run: ./build-deb.sh "${{ needs.check.outputs.version }}" "${{ matrix.arch }}" "${{ needs.check.outputs.revision }}" dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.arch }}
+          path: dist/*.deb
+          if-no-files-found: error
+
+  test:
+    needs: [check, build]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["debian:bookworm", "debian:trixie", "ubuntu:24.04"]
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: deb-${{ matrix.arch }}
+          path: dist
+      - name: Installieren
+        run: |
+          apt-get update -q
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -q ca-certificates ./dist/*.deb
+      - name: Testen
+        run: |
+          set -e
+          cd /
+          python3 - <<'PY'
+          import cffi, curl_cffi
+          from curl_cffi import requests
+          print("python-cffi", cffi.__version__, "| curl_cffi", curl_cffi.__version__)
+          assert curl_cffi.__version__ == "${{ needs.check.outputs.version }}", curl_cffi.__version__
+          r = requests.get("https://pypi.org/pypi/curl_cffi/json", impersonate="chrome", timeout=30)
+          r.raise_for_status()
+          print("HTTP", r.status_code, "OK")
+          PY
+          curl-cffi --help >/dev/null
+          DEBIAN_FRONTEND=noninteractive apt-get remove -y -q python3-curl-cffi
+          test ! -e /usr/lib/python3/dist-packages/curl_cffi
+
+  release:
+    needs: [check, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: deb-*
+          path: dist
+          merge-multiple: true
+      - name: Release erstellen
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum *.deb > SHA256SUMS
+          cat > notes.md <<EOF
+          Debian-/Ubuntu-Pakete für [curl_cffi ${VERSION}](https://pypi.org/project/curl_cffi/${VERSION}/), umgepackt aus den offiziellen manylinux-Wheels.
+
+          Getestet auf Debian 12, Debian 13 und Ubuntu 24.04 (amd64 + arm64).
+
+          \`\`\`
+          sudo apt install ./python3-curl-cffi_*_\$(dpkg --print-architecture).deb
+          \`\`\`
+          EOF
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" *.deb SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" *.deb SHA256SUMS \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "curl_cffi ${VERSION}" \
+              --notes-file notes.md \
+              --latest
+          fi
